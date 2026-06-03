@@ -22,6 +22,7 @@ Data storage:
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -60,28 +61,122 @@ LINE_ITEM_COLUMNS = ["category", "description", "quantity", "unit_price", "taxab
 # -----------------------------------------------------------------------------
 
 
-def connect() -> sqlite3.Connection:
+def get_database_url() -> str | None:
+    if os.environ.get("DATABASE_URL"):
+        return os.environ["DATABASE_URL"]
+    try:
+        return st.secrets.get("DATABASE_URL")
+    except Exception:
+        return None
+
+
+def get_secret(name: str) -> str | None:
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        return None
+    return str(value) if value else None
+
+
+DATABASE_URL = get_database_url()
+APP_PASSWORD = get_secret("APP_PASSWORD")
+
+
+@dataclass
+class DbResult:
+    lastrowid: int | None = None
+
+
+def using_postgres() -> bool:
+    return bool(DATABASE_URL)
+
+
+def pg_sql(sql: str) -> str:
+    return sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY").replace("?", "%s")
+
+
+def connect() -> Any:
+    if using_postgres():
+        import psycopg
+        from psycopg.rows import dict_row
+
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None)
+
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def execute(sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
+def execute(sql: str, params: tuple[Any, ...] = (), returning: str | None = None) -> DbResult:
     with connect() as conn:
+        if using_postgres():
+            statement = pg_sql(sql)
+            if returning:
+                statement = f"{statement.rstrip()} RETURNING {returning}"
+            cur = conn.execute(statement, params)
+            row = cur.fetchone() if returning else None
+            conn.commit()
+            return DbResult(lastrowid=int(row[returning]) if row else None)
+
         cur = conn.execute(sql, params)
         conn.commit()
-        return cur
+        return DbResult(lastrowid=cur.lastrowid)
 
 
 def query_df(sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
     with connect() as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+        if using_postgres():
+            cur = conn.execute(pg_sql(sql), params)
+            rows = cur.fetchall()
+            columns = [column.name for column in cur.description or []]
+            return pd.DataFrame(rows, columns=columns)
+
+        return pd.read_sql_query(pg_sql(sql) if using_postgres() else sql, conn, params=params)
 
 
-def query_one(sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
+def query_one(sql: str, params: tuple[Any, ...] = ()) -> Any | None:
     with connect() as conn:
-        cur = conn.execute(sql, params)
+        cur = conn.execute(pg_sql(sql) if using_postgres() else sql, params)
         return cur.fetchone()
+
+
+def is_unique_violation(error: Exception) -> bool:
+    if isinstance(error, sqlite3.IntegrityError):
+        return True
+    if using_postgres():
+        try:
+            import psycopg
+
+            return isinstance(error, psycopg.errors.UniqueViolation)
+        except Exception:
+            return False
+    return False
+
+
+def require_password() -> bool:
+    if not APP_PASSWORD:
+        return True
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("Precision Bicycle Services")
+    st.caption("Enter the app password to continue.")
+
+    with st.form("password_form"):
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Unlock")
+
+    if submitted:
+        if password == APP_PASSWORD:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+    return False
 
 
 def clean_text(value: Any) -> str:
@@ -273,6 +368,7 @@ def seed_templates() -> None:
                 DEFAULT_TAX_RATE,
                 now,
             ),
+            returning="template_id",
         )
         template_id = cur.lastrowid
         for category, description, qty, unit_price, taxable in template["items"]:
@@ -388,6 +484,7 @@ def create_customer(name: str, email: str, phone: str, notes: str) -> int:
         VALUES (?, ?, ?, ?, ?)
         """,
         (name.strip(), email.strip(), phone.strip(), notes.strip(), now_iso()),
+        returning="customer_id",
     )
     return int(cur.lastrowid)
 
@@ -425,6 +522,7 @@ def create_bike(
             clean_text(notes),
             now_iso(),
         ),
+        returning="bike_id",
     )
     return int(cur.lastrowid)
 
@@ -468,6 +566,7 @@ def create_job_order(
             timestamp,
             timestamp,
         ),
+        returning="job_id",
     )
     job_id = int(cur.lastrowid)
     job_number = f"JO-{date.today().strftime('%Y%m%d')}-{job_id:04d}"
@@ -725,6 +824,7 @@ def create_template(
             default_tax_rate,
             now_iso(),
         ),
+        returning="template_id",
     )
     template_id = int(cur.lastrowid)
     df = normalize_line_items(line_items)
@@ -876,8 +976,20 @@ def page_new_job() -> None:
 
     st.subheader("3. Template + job details")
     templates = get_templates()
-    template_labels = ["No template"] + [str(name) for name in templates["name"].tolist()]
-    template_choice = st.selectbox("Job template", template_labels, key="template_choice")
+    template_by_id = {
+        int(row["template_id"]): row
+        for _, row in templates.iterrows()
+        if str(row.get("template_id", "")).isdigit()
+    }
+    template_options = [None] + list(template_by_id.keys())
+    template_choice = st.selectbox(
+        "Job template",
+        template_options,
+        format_func=lambda template_id: "No template"
+        if template_id is None
+        else str(template_by_id[template_id]["name"]),
+        key="template_choice",
+    )
 
     selected_template_id = None
     default_customer_notes = ""
@@ -885,9 +997,9 @@ def page_new_job() -> None:
     tax_rate = DEFAULT_TAX_RATE
     default_items = pd.DataFrame(columns=LINE_ITEM_COLUMNS)
 
-    if template_choice != "No template":
-        template_row = templates[templates["name"] == template_choice].iloc[0]
-        selected_template_id = int(template_row["template_id"])
+    if template_choice is not None:
+        template_row = template_by_id[int(template_choice)]
+        selected_template_id = int(template_choice)
         default_customer_notes = str(template_row["default_customer_notes"] or "")
         default_internal_notes = str(template_row["default_internal_notes"] or "")
         tax_rate = float(template_row["default_tax_rate"] or DEFAULT_TAX_RATE)
@@ -908,7 +1020,7 @@ def page_new_job() -> None:
     customer_notes = st.text_area("Customer-facing service notes", value=default_customer_notes, height=120)
 
     st.subheader("4. Line items")
-    edited_items = line_item_editor(default_items, key=f"line_items_{template_choice}")
+    edited_items = line_item_editor(default_items, key=f"line_items_{template_choice or 'none'}")
     totals = calculate_totals(edited_items, tax_rate)
 
     c1, c2, c3 = st.columns(3)
@@ -1197,8 +1309,11 @@ def page_templates() -> None:
                     )
                     st.success("Template saved.")
                     st.rerun()
-                except sqlite3.IntegrityError:
-                    st.error("A template with that name already exists.")
+                except Exception as error:
+                    if is_unique_violation(error):
+                        st.error("A template with that name already exists.")
+                    else:
+                        raise
 
 
 def page_dashboard_exports() -> None:
@@ -1265,6 +1380,9 @@ def page_dashboard_exports() -> None:
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🚲", layout="wide")
+    if not require_password():
+        return
+
     init_db()
 
     st.title("Precison Bicycle Services: Order and Invoicing System")
