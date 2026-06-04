@@ -846,6 +846,51 @@ def create_template(
     return template_id
 
 
+def update_template(
+    template_id: int,
+    name: str,
+    default_customer_notes: str,
+    default_internal_notes: str,
+    default_tax_rate: float,
+    line_items: pd.DataFrame,
+) -> None:
+    execute(
+        """
+        UPDATE templates
+        SET name = ?,
+            default_customer_notes = ?,
+            default_internal_notes = ?,
+            default_tax_rate = ?
+        WHERE template_id = ?
+        """,
+        (
+            name.strip(),
+            default_customer_notes.strip(),
+            default_internal_notes.strip(),
+            default_tax_rate,
+            template_id,
+        ),
+    )
+    execute("DELETE FROM template_line_items WHERE template_id = ?", (template_id,))
+
+    df = normalize_line_items(line_items)
+    for _, row in df.iterrows():
+        execute(
+            """
+            INSERT INTO template_line_items (template_id, category, description, quantity, unit_price, taxable)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                template_id,
+                str(row["category"]),
+                str(row["description"]),
+                float(row["quantity"]),
+                float(row["unit_price"]),
+                int(bool(row["taxable"])),
+            ),
+        )
+
+
 # -----------------------------------------------------------------------------
 # Streamlit UI helpers
 # -----------------------------------------------------------------------------
@@ -1252,15 +1297,68 @@ def page_templates() -> None:
 
     templates = get_templates()
     st.subheader("Existing templates")
-    st.dataframe(templates[["template_id", "name", "default_tax_rate"]], use_container_width=True, hide_index=True)
+    if templates.empty:
+        st.info("No templates yet. Create one below.")
+    else:
+        st.dataframe(templates[["template_id", "name", "default_tax_rate"]], use_container_width=True, hide_index=True)
 
-    if not templates.empty:
-        selected_template_id = st.selectbox(
-            "Preview template line items",
-            templates["template_id"].tolist(),
-            format_func=lambda tid: templates.loc[templates["template_id"] == tid, "name"].iloc[0],
-        )
-        st.dataframe(get_template_line_items(int(selected_template_id)), use_container_width=True, hide_index=True)
+        with st.container(border=True):
+            st.subheader("Select a template to edit")
+            st.caption("Changes here affect future job orders that use this template. Existing jobs stay unchanged.")
+            selected_template_id = st.selectbox(
+                "Template",
+                templates["template_id"].tolist(),
+                format_func=lambda tid: templates.loc[templates["template_id"] == tid, "name"].iloc[0],
+                key="edit_template_selector",
+            )
+
+            template_row = templates.loc[templates["template_id"] == selected_template_id].iloc[0]
+            existing_items = get_template_line_items(int(selected_template_id))
+
+            with st.form(f"edit_template_form_{selected_template_id}"):
+                edit_name = st.text_input("Template name *", value=str(template_row["name"]))
+                edit_customer_notes = st.text_area(
+                    "Default customer-facing notes",
+                    value=str(template_row["default_customer_notes"] or ""),
+                )
+                edit_internal_notes = st.text_area(
+                    "Default internal notes",
+                    value=str(template_row["default_internal_notes"] or ""),
+                )
+                edit_tax_pct = st.number_input(
+                    "Default tax rate (%)",
+                    min_value=0.0,
+                    max_value=25.0,
+                    value=float(template_row["default_tax_rate"] or DEFAULT_TAX_RATE) * 100,
+                    step=0.25,
+                    key=f"edit_template_tax_{selected_template_id}",
+                )
+                edited_template_items = line_item_editor(
+                    existing_items,
+                    key=f"edit_template_items_{selected_template_id}",
+                )
+
+                edit_submitted = st.form_submit_button("Save template changes")
+                if edit_submitted:
+                    if not edit_name.strip():
+                        st.error("Template name is required.")
+                    else:
+                        try:
+                            update_template(
+                                int(selected_template_id),
+                                edit_name,
+                                edit_customer_notes,
+                                edit_internal_notes,
+                                edit_tax_pct / 100,
+                                edited_template_items,
+                            )
+                            st.success("Template updated.")
+                            st.rerun()
+                        except Exception as error:
+                            if is_unique_violation(error):
+                                st.error("A template with that name already exists.")
+                            else:
+                                raise
 
     st.divider()
     st.subheader("Create new template")
