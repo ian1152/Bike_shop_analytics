@@ -465,6 +465,20 @@ def get_template_line_items(template_id: int) -> pd.DataFrame:
     )
 
 
+def template_summary_df(templates: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, template in templates.iterrows():
+        items = get_template_line_items(int(template["template_id"]))
+        totals = calculate_totals(items, DEFAULT_TAX_RATE)
+        rows.append(
+            {
+                "name": template["name"],
+                "total_price": totals.total,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def get_job_line_items(job_id: int) -> pd.DataFrame:
     return query_df(
         """
@@ -1047,17 +1061,13 @@ def page_new_job() -> None:
         selected_template_id = int(template_choice)
         default_customer_notes = str(template_row["default_customer_notes"] or "")
         default_internal_notes = str(template_row["default_internal_notes"] or "")
-        tax_rate = float(template_row["default_tax_rate"] or DEFAULT_TAX_RATE)
         default_items = get_template_line_items(selected_template_id)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         status = st.selectbox("Job status", STATUS_OPTIONS, index=0)
     with col2:
         payment_status = st.selectbox("Payment status", PAYMENT_STATUS_OPTIONS, index=0)
-    with col3:
-        tax_rate_pct = st.number_input("Sales tax rate (%)", min_value=0.0, max_value=25.0, value=tax_rate * 100, step=0.25)
-    tax_rate = float(tax_rate_pct / 100)
 
     intake_notes = st.text_area("Intake notes / customer request", placeholder="What did the customer ask for?", height=100)
     diagnosis_notes = st.text_area("Diagnosis notes", placeholder="What did you find?", height=100)
@@ -1070,7 +1080,7 @@ def page_new_job() -> None:
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Subtotal", money(totals.subtotal))
-    c2.metric("Tax", money(totals.tax))
+    c2.metric(f"Tax ({tax_rate * 100:.2f}%)", money(totals.tax))
     c3.metric("Total", money(totals.total))
 
     st.divider()
@@ -1300,7 +1310,15 @@ def page_templates() -> None:
     if templates.empty:
         st.info("No templates yet. Create one below.")
     else:
-        st.dataframe(templates[["template_id", "name", "default_tax_rate"]], use_container_width=True, hide_index=True)
+        st.dataframe(
+            template_summary_df(templates),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "name": st.column_config.TextColumn("Template"),
+                "total_price": st.column_config.NumberColumn("Total price", format="$%.2f"),
+            },
+        )
 
         with st.container(border=True):
             st.subheader("Select a template to edit")
@@ -1325,14 +1343,6 @@ def page_templates() -> None:
                     "Default internal notes",
                     value=str(template_row["default_internal_notes"] or ""),
                 )
-                edit_tax_pct = st.number_input(
-                    "Default tax rate (%)",
-                    min_value=0.0,
-                    max_value=25.0,
-                    value=float(template_row["default_tax_rate"] or DEFAULT_TAX_RATE) * 100,
-                    step=0.25,
-                    key=f"edit_template_tax_{selected_template_id}",
-                )
                 edited_template_items = line_item_editor(
                     existing_items,
                     key=f"edit_template_items_{selected_template_id}",
@@ -1349,7 +1359,7 @@ def page_templates() -> None:
                                 edit_name,
                                 edit_customer_notes,
                                 edit_internal_notes,
-                                edit_tax_pct / 100,
+                                DEFAULT_TAX_RATE,
                                 edited_template_items,
                             )
                             st.success("Template updated.")
@@ -1366,7 +1376,6 @@ def page_templates() -> None:
         name = st.text_input("Template name *")
         default_customer_notes = st.text_area("Default customer-facing notes")
         default_internal_notes = st.text_area("Default internal notes")
-        tax_pct = st.number_input("Default tax rate (%)", min_value=0.0, max_value=25.0, value=6.0, step=0.25)
         template_items = st.data_editor(
             pd.DataFrame(
                 [
@@ -1402,7 +1411,7 @@ def page_templates() -> None:
                         name,
                         default_customer_notes,
                         default_internal_notes,
-                        tax_pct / 100,
+                        DEFAULT_TAX_RATE,
                         template_items,
                     )
                     st.success("Template saved.")
