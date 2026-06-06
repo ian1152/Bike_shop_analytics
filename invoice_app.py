@@ -139,6 +139,21 @@ def query_one(sql: str, params: tuple[Any, ...] = ()) -> Any | None:
         return cur.fetchone()
 
 
+def execute_in_connection(conn: Any, sql: str, params: tuple[Any, ...] = (), returning: str | None = None) -> DbResult:
+    statement = pg_sql(sql) if using_postgres() else sql
+    if using_postgres():
+        if returning:
+            statement = f"{statement.rstrip()} RETURNING {returning}"
+            cur = conn.execute(statement, params)
+            row = cur.fetchone()
+            return DbResult(lastrowid=int(row[returning]) if row else None)
+        conn.execute(statement, params)
+        return DbResult()
+
+    cur = conn.execute(statement, params)
+    return DbResult(lastrowid=cur.lastrowid)
+
+
 def is_unique_violation(error: Exception) -> bool:
     if isinstance(error, sqlite3.IntegrityError):
         return True
@@ -214,6 +229,17 @@ def normalize_job_statuses() -> None:
         """,
         (now_iso(),),
     )
+
+
+def ensure_indexes() -> None:
+    for sql in [
+        "CREATE INDEX IF NOT EXISTS idx_job_orders_deleted_status ON job_orders (deleted_at, status)",
+        "CREATE INDEX IF NOT EXISTS idx_job_orders_customer_id ON job_orders (customer_id)",
+        "CREATE INDEX IF NOT EXISTS idx_job_line_items_job_id ON job_line_items (job_id)",
+        "CREATE INDEX IF NOT EXISTS idx_bikes_customer_id ON bikes (customer_id)",
+        "CREATE INDEX IF NOT EXISTS idx_template_line_items_template_id ON template_line_items (template_id)",
+    ]:
+        execute(sql)
 
 
 def init_db() -> None:
@@ -315,7 +341,14 @@ def init_db() -> None:
         )
         """
     )
+    ensure_indexes()
     seed_templates()
+
+
+@st.cache_resource(show_spinner=False)
+def initialize_database() -> bool:
+    init_db()
+    return True
 
 
 def seed_templates() -> None:
@@ -498,17 +531,22 @@ def get_template_line_items(template_id: int) -> pd.DataFrame:
 
 
 def template_summary_df(templates: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for _, template in templates.iterrows():
-        items = get_template_line_items(int(template["template_id"]))
-        totals = calculate_totals(items, DEFAULT_TAX_RATE)
-        rows.append(
-            {
-                "name": template["name"],
-                "total_price": totals.total,
-            }
-        )
-    return pd.DataFrame(rows)
+    line_totals = query_df(
+        """
+        SELECT
+            template_id,
+            COALESCE(SUM(quantity * unit_price), 0) AS subtotal,
+            COALESCE(SUM(CASE WHEN taxable = 1 THEN quantity * unit_price ELSE 0 END), 0) AS taxable_subtotal
+        FROM template_line_items
+        GROUP BY template_id
+        """
+    )
+    summary = templates[["template_id", "name"]].merge(line_totals, on="template_id", how="left").fillna(0)
+    summary["subtotal"] = pd.to_numeric(summary["subtotal"], errors="coerce").fillna(0.0)
+    summary["taxable_subtotal"] = pd.to_numeric(summary["taxable_subtotal"], errors="coerce").fillna(0.0)
+    summary["tax"] = (summary["taxable_subtotal"] * DEFAULT_TAX_RATE).round(2)
+    summary["total_price"] = (summary["subtotal"] + summary["tax"]).round(2)
+    return summary[["name", "total_price"]]
 
 
 def get_job_line_items(job_id: int) -> pd.DataFrame:
@@ -587,53 +625,56 @@ def create_job_order(
     line_items: pd.DataFrame,
 ) -> int:
     timestamp = now_iso()
-    cur = execute(
-        """
-        INSERT INTO job_orders (
-            job_number, customer_id, bike_id, template_id, date_created, status,
-            intake_notes, diagnosis_notes, internal_notes, customer_notes,
-            tax_rate, payment_status, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            None,
-            customer_id,
-            bike_id,
-            template_id,
-            date.today().isoformat(),
-            status,
-            intake_notes.strip(),
-            diagnosis_notes.strip(),
-            internal_notes.strip(),
-            customer_notes.strip(),
-            tax_rate,
-            payment_status,
-            timestamp,
-            timestamp,
-        ),
-        returning="job_id",
-    )
-    job_id = int(cur.lastrowid)
-    job_number = f"JO-{date.today().strftime('%Y%m%d')}-{job_id:04d}"
-    execute("UPDATE job_orders SET job_number = ? WHERE job_id = ?", (job_number, job_id))
-
     df = normalize_line_items(line_items)
-    for _, row in df.iterrows():
-        execute(
+    with connect() as conn:
+        cur = execute_in_connection(
+            conn,
             """
-            INSERT INTO job_line_items (job_id, category, description, quantity, unit_price, taxable)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO job_orders (
+                job_number, customer_id, bike_id, template_id, date_created, status,
+                intake_notes, diagnosis_notes, internal_notes, customer_notes,
+                tax_rate, payment_status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                job_id,
-                str(row["category"]),
-                str(row["description"]),
-                float(row["quantity"]),
-                float(row["unit_price"]),
-                int(bool(row["taxable"])),
+                None,
+                customer_id,
+                bike_id,
+                template_id,
+                date.today().isoformat(),
+                status,
+                intake_notes.strip(),
+                diagnosis_notes.strip(),
+                internal_notes.strip(),
+                customer_notes.strip(),
+                tax_rate,
+                payment_status,
+                timestamp,
+                timestamp,
             ),
+            returning="job_id",
         )
+        job_id = int(cur.lastrowid)
+        job_number = f"JO-{date.today().strftime('%Y%m%d')}-{job_id:04d}"
+        execute_in_connection(conn, "UPDATE job_orders SET job_number = ? WHERE job_id = ?", (job_number, job_id))
+
+        for _, row in df.iterrows():
+            execute_in_connection(
+                conn,
+                """
+                INSERT INTO job_line_items (job_id, category, description, quantity, unit_price, taxable)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    str(row["category"]),
+                    str(row["description"]),
+                    float(row["quantity"]),
+                    float(row["unit_price"]),
+                    int(bool(row["taxable"])),
+                ),
+            )
     return job_id
 
 
@@ -694,34 +735,33 @@ def job_summary_df(view: str = "active") -> pd.DataFrame:
             j.zettle_receipt_url,
             j.paypal_invoice_id,
             j.paypal_invoice_url,
-            j.deleted_at
+            j.deleted_at,
+            COALESCE(SUM(li.quantity * li.unit_price), 0) AS subtotal,
+            COALESCE(SUM(CASE WHEN li.taxable = 1 THEN li.quantity * li.unit_price ELSE 0 END), 0)
+                AS taxable_subtotal
         FROM job_orders j
         JOIN customers c ON c.customer_id = j.customer_id
         LEFT JOIN bikes b ON b.bike_id = j.bike_id
         LEFT JOIN templates t ON t.template_id = j.template_id
+        LEFT JOIN job_line_items li ON li.job_id = j.job_id
         {deleted_filter}
+        GROUP BY
+            j.job_id, j.job_number, j.date_created, j.status, j.payment_status,
+            c.name, c.email, b.nickname, b.brand_model, t.name, j.tax_rate,
+            j.zettle_receipt_number, j.zettle_receipt_url, j.paypal_invoice_id,
+            j.paypal_invoice_url, j.deleted_at
         ORDER BY j.job_id DESC
         """
     )
     if jobs.empty:
         return jobs
 
-    totals = []
-    for job_id in jobs["job_id"]:
-        detail = get_job_detail(int(job_id), include_deleted=True)
-        items = get_job_line_items(int(job_id))
-        tax_rate = float(detail["tax_rate"] if detail else DEFAULT_TAX_RATE)
-        t = calculate_totals(items, tax_rate)
-        totals.append(
-            {
-                "job_id": job_id,
-                "subtotal": t.subtotal,
-                "tax": t.tax,
-                "total": t.total,
-            }
-        )
-    total_df = pd.DataFrame(totals)
-    return jobs.merge(total_df, on="job_id", how="left")
+    for column in ["subtotal", "taxable_subtotal", "tax_rate"]:
+        jobs[column] = pd.to_numeric(jobs[column], errors="coerce").fillna(0.0)
+    jobs["subtotal"] = jobs["subtotal"].round(2)
+    jobs["tax"] = (jobs["taxable_subtotal"] * jobs["tax_rate"]).round(2)
+    jobs["total"] = (jobs["subtotal"] + jobs["tax"]).round(2)
+    return jobs.drop(columns=["taxable_subtotal"])
 
 
 def trash_job(job_id: int) -> None:
@@ -818,12 +858,17 @@ def line_items_to_text(items: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def generate_customer_invoice_text(job_id: int) -> str:
-    detail = get_job_detail(job_id)
+def generate_customer_invoice_text(
+    job_id: int,
+    detail: dict[str, Any] | None = None,
+    items: pd.DataFrame | None = None,
+    totals: Totals | None = None,
+) -> str:
+    detail = detail or get_job_detail(job_id)
     if not detail:
         return "Job not found."
-    items = get_job_line_items(job_id)
-    totals = calculate_totals(items, float(detail["tax_rate"]))
+    items = items if items is not None else get_job_line_items(job_id)
+    totals = totals or calculate_totals(items, float(detail["tax_rate"]))
     bike = format_bike(detail)
 
     notes = detail.get("customer_notes") or ""
@@ -847,12 +892,17 @@ Payment status: {detail['payment_status']}
 """.strip()
 
 
-def generate_email_text(job_id: int) -> tuple[str, str, str]:
-    detail = get_job_detail(job_id)
+def generate_email_text(
+    job_id: int,
+    detail: dict[str, Any] | None = None,
+    items: pd.DataFrame | None = None,
+    totals: Totals | None = None,
+) -> tuple[str, str, str]:
+    detail = detail or get_job_detail(job_id)
     if not detail:
         return "", "", ""
-    items = get_job_line_items(job_id)
-    totals = calculate_totals(items, float(detail["tax_rate"]))
+    items = items if items is not None else get_job_line_items(job_id)
+    totals = totals or calculate_totals(items, float(detail["tax_rate"]))
     bike = format_bike(detail)
     first_name = str(detail["customer_name"]).split()[0] if detail.get("customer_name") else "there"
     subject = f"Bike service invoice - {bike}"
@@ -880,12 +930,17 @@ Precision Bicycle Services
     return to, subject, body
 
 
-def generate_zettle_entry_summary(job_id: int) -> str:
-    detail = get_job_detail(job_id)
+def generate_zettle_entry_summary(
+    job_id: int,
+    detail: dict[str, Any] | None = None,
+    items: pd.DataFrame | None = None,
+    totals: Totals | None = None,
+) -> str:
+    detail = detail or get_job_detail(job_id)
     if not detail:
         return "Job not found."
-    items = get_job_line_items(job_id)
-    totals = calculate_totals(items, float(detail["tax_rate"]))
+    items = items if items is not None else get_job_line_items(job_id)
+    totals = totals or calculate_totals(items, float(detail["tax_rate"]))
 
     return f"""Zettle / PayPal POS entry summary
 {detail['job_number']}
@@ -911,37 +966,40 @@ def create_template(
     default_tax_rate: float,
     line_items: pd.DataFrame,
 ) -> int:
-    cur = execute(
-        """
-        INSERT INTO templates (name, default_customer_notes, default_internal_notes, default_tax_rate, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            name.strip(),
-            default_customer_notes.strip(),
-            default_internal_notes.strip(),
-            default_tax_rate,
-            now_iso(),
-        ),
-        returning="template_id",
-    )
-    template_id = int(cur.lastrowid)
     df = normalize_line_items(line_items)
-    for _, row in df.iterrows():
-        execute(
+    with connect() as conn:
+        cur = execute_in_connection(
+            conn,
             """
-            INSERT INTO template_line_items (template_id, category, description, quantity, unit_price, taxable)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO templates (name, default_customer_notes, default_internal_notes, default_tax_rate, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
-                template_id,
-                str(row["category"]),
-                str(row["description"]),
-                float(row["quantity"]),
-                float(row["unit_price"]),
-                int(bool(row["taxable"])),
+                name.strip(),
+                default_customer_notes.strip(),
+                default_internal_notes.strip(),
+                default_tax_rate,
+                now_iso(),
             ),
+            returning="template_id",
         )
+        template_id = int(cur.lastrowid)
+        for _, row in df.iterrows():
+            execute_in_connection(
+                conn,
+                """
+                INSERT INTO template_line_items (template_id, category, description, quantity, unit_price, taxable)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    template_id,
+                    str(row["category"]),
+                    str(row["description"]),
+                    float(row["quantity"]),
+                    float(row["unit_price"]),
+                    int(bool(row["taxable"])),
+                ),
+            )
     return template_id
 
 
@@ -953,41 +1011,43 @@ def update_template(
     default_tax_rate: float,
     line_items: pd.DataFrame,
 ) -> None:
-    execute(
-        """
-        UPDATE templates
-        SET name = ?,
-            default_customer_notes = ?,
-            default_internal_notes = ?,
-            default_tax_rate = ?
-        WHERE template_id = ?
-        """,
-        (
-            name.strip(),
-            default_customer_notes.strip(),
-            default_internal_notes.strip(),
-            default_tax_rate,
-            template_id,
-        ),
-    )
-    execute("DELETE FROM template_line_items WHERE template_id = ?", (template_id,))
-
     df = normalize_line_items(line_items)
-    for _, row in df.iterrows():
-        execute(
+    with connect() as conn:
+        execute_in_connection(
+            conn,
             """
-            INSERT INTO template_line_items (template_id, category, description, quantity, unit_price, taxable)
-            VALUES (?, ?, ?, ?, ?, ?)
+            UPDATE templates
+            SET name = ?,
+                default_customer_notes = ?,
+                default_internal_notes = ?,
+                default_tax_rate = ?
+            WHERE template_id = ?
             """,
             (
+                name.strip(),
+                default_customer_notes.strip(),
+                default_internal_notes.strip(),
+                default_tax_rate,
                 template_id,
-                str(row["category"]),
-                str(row["description"]),
-                float(row["quantity"]),
-                float(row["unit_price"]),
-                int(bool(row["taxable"])),
             ),
         )
+        execute_in_connection(conn, "DELETE FROM template_line_items WHERE template_id = ?", (template_id,))
+        for _, row in df.iterrows():
+            execute_in_connection(
+                conn,
+                """
+                INSERT INTO template_line_items (template_id, category, description, quantity, unit_price, taxable)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    template_id,
+                    str(row["category"]),
+                    str(row["description"]),
+                    float(row["quantity"]),
+                    float(row["unit_price"]),
+                    int(bool(row["taxable"])),
+                ),
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -1228,10 +1288,20 @@ def page_new_job() -> None:
         render_invoice_outputs(job_id)
 
 
-def render_invoice_outputs(job_id: int) -> None:
-    invoice_text = generate_customer_invoice_text(job_id)
-    to, subject, email_body = generate_email_text(job_id)
-    zettle_summary = generate_zettle_entry_summary(job_id)
+def render_invoice_outputs(
+    job_id: int,
+    detail: dict[str, Any] | None = None,
+    items: pd.DataFrame | None = None,
+) -> None:
+    detail = detail or get_job_detail(job_id)
+    if not detail:
+        st.error("Job not found.")
+        return
+    items = items if items is not None else get_job_line_items(job_id)
+    totals = calculate_totals(items, float(detail["tax_rate"]))
+    invoice_text = generate_customer_invoice_text(job_id, detail, items, totals)
+    to, subject, email_body = generate_email_text(job_id, detail, items, totals)
+    zettle_summary = generate_zettle_entry_summary(job_id, detail, items, totals)
 
     tab1, tab2, tab3 = st.tabs(["Customer invoice text", "Email draft", "Zettle entry summary"])
     with tab1:
@@ -1384,10 +1454,6 @@ def render_payment_tracking(detail: dict[str, Any], job_id: int, form_key: str) 
 
 
 def render_active_jobs() -> None:
-    notice = st.session_state.pop("job_notice", None)
-    if notice:
-        st.success(notice)
-
     jobs = job_summary_df("in_progress")
     if jobs.empty:
         st.info("No active work orders.")
@@ -1439,7 +1505,7 @@ def render_active_jobs() -> None:
     detail = get_job_detail(int(selected_job_id))
     if detail:
         st.subheader(f"{detail['job_number']} — {detail['customer_name']}")
-        render_invoice_outputs(int(selected_job_id))
+        render_invoice_outputs(int(selected_job_id), detail=detail)
         render_payment_tracking(detail, int(selected_job_id), "active_payment_update_form")
 
         st.divider()
@@ -1492,7 +1558,7 @@ def render_completed_jobs() -> None:
         return
 
     st.subheader(f"{detail['job_number']} — {detail['customer_name']}")
-    render_invoice_outputs(int(selected_job_id))
+    render_invoice_outputs(int(selected_job_id), detail=detail)
     render_payment_tracking(detail, int(selected_job_id), "completed_payment_update_form")
 
     st.divider()
@@ -1563,12 +1629,21 @@ def render_trashed_jobs() -> None:
 
 def page_jobs_invoices() -> None:
     st.header("Jobs + Invoices")
-    active_tab, completed_tab, trash_tab = st.tabs(["In progress", "Completed", "Trash"])
-    with active_tab:
+    notice = st.session_state.pop("job_notice", None)
+    if notice:
+        st.success(notice)
+
+    view = st.radio(
+        "Work order view",
+        ["In progress", "Completed", "Trash"],
+        horizontal=True,
+        key="work_order_view",
+    )
+    if view == "In progress":
         render_active_jobs()
-    with completed_tab:
+    elif view == "Completed":
         render_completed_jobs()
-    with trash_tab:
+    else:
         render_trashed_jobs()
 
 
@@ -1763,7 +1838,7 @@ def main() -> None:
     if not require_password():
         return
 
-    init_db()
+    initialize_database()
 
     st.title("Precison Bicycle Services: Order and Invoicing System")
     st.caption("Job templates, customer/bike history, invoice preparation and email, and PayPal entry summaries.")
