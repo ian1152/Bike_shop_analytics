@@ -44,11 +44,7 @@ DB_PATH = Path(__file__).with_name("invoice_app.db")
 DEFAULT_TAX_RATE = 0.06
 
 STATUS_OPTIONS = [
-    "Estimate",
-    "Waiting approval",
     "In progress",
-    "Ready",
-    "Picked up",
     "Closed",
 ]
 
@@ -209,6 +205,17 @@ def ensure_job_orders_deleted_at_column() -> None:
     execute("ALTER TABLE job_orders ADD COLUMN deleted_at TEXT")
 
 
+def normalize_job_statuses() -> None:
+    execute(
+        """
+        UPDATE job_orders
+        SET status = 'In progress', updated_at = ?
+        WHERE status NOT IN ('In progress', 'Closed')
+        """,
+        (now_iso(),),
+    )
+
+
 def init_db() -> None:
     execute(
         """
@@ -293,6 +300,7 @@ def init_db() -> None:
         """
     )
     ensure_job_orders_deleted_at_column()
+    normalize_job_statuses()
     execute(
         """
         CREATE TABLE IF NOT EXISTS job_line_items (
@@ -660,6 +668,10 @@ def get_job_detail(job_id: int, include_deleted: bool = False) -> dict[str, Any]
 def job_summary_df(view: str = "active") -> pd.DataFrame:
     if view == "trash":
         deleted_filter = "WHERE j.deleted_at IS NOT NULL"
+    elif view == "in_progress":
+        deleted_filter = "WHERE j.deleted_at IS NULL AND j.status = 'In progress'"
+    elif view == "completed":
+        deleted_filter = "WHERE j.deleted_at IS NULL AND j.status = 'Closed'"
     elif view == "all":
         deleted_filter = ""
     else:
@@ -732,6 +744,19 @@ def restore_job(job_id: int) -> None:
         WHERE job_id = ? AND deleted_at IS NOT NULL
         """,
         (now_iso(), job_id),
+    )
+
+
+def update_job_status(job_id: int, status: str) -> None:
+    if status not in STATUS_OPTIONS:
+        raise ValueError(f"Unsupported job status: {status}")
+    execute(
+        """
+        UPDATE job_orders
+        SET status = ?, updated_at = ?
+        WHERE job_id = ? AND deleted_at IS NULL
+        """,
+        (status, now_iso(), job_id),
     )
 
 
@@ -1123,11 +1148,9 @@ def page_new_job() -> None:
         default_internal_notes = str(template_row["default_internal_notes"] or "")
         default_items = get_template_line_items(selected_template_id)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        status = st.selectbox("Job status", STATUS_OPTIONS, index=0)
-    with col2:
-        payment_status = st.selectbox("Payment status", PAYMENT_STATUS_OPTIONS, index=0)
+    status = "In progress"
+    st.caption("New work orders start In progress.")
+    payment_status = st.selectbox("Payment status", PAYMENT_STATUS_OPTIONS, index=0)
 
     intake_notes = st.text_area("Intake notes / customer request", placeholder="What did the customer ask for?", height=100)
     diagnosis_notes = st.text_area("Diagnosis notes", placeholder="What did you find?", height=100)
@@ -1333,12 +1356,39 @@ def confirm_trash_job(job_id: int) -> None:
             st.rerun()
 
 
+def render_payment_tracking(detail: dict[str, Any], job_id: int, form_key: str) -> None:
+    st.subheader("Payment / receipt tracking")
+    with st.form(form_key):
+        payment_status = st.selectbox(
+            "Payment status",
+            PAYMENT_STATUS_OPTIONS,
+            index=PAYMENT_STATUS_OPTIONS.index(detail["payment_status"])
+            if detail["payment_status"] in PAYMENT_STATUS_OPTIONS
+            else 0,
+        )
+        zettle_receipt_number = st.text_input("Zettle receipt number", value=detail.get("zettle_receipt_number") or "")
+        zettle_receipt_url = st.text_input("Zettle receipt URL", value=detail.get("zettle_receipt_url") or "")
+        paypal_invoice_id = st.text_input("PayPal invoice ID", value=detail.get("paypal_invoice_id") or "")
+        paypal_invoice_url = st.text_input("PayPal invoice URL", value=detail.get("paypal_invoice_url") or "")
+        if st.form_submit_button("Update payment details"):
+            update_payment_status(
+                job_id,
+                payment_status,
+                zettle_receipt_number,
+                zettle_receipt_url,
+                paypal_invoice_id,
+                paypal_invoice_url,
+            )
+            st.success("Payment details updated.")
+            st.rerun()
+
+
 def render_active_jobs() -> None:
     notice = st.session_state.pop("job_notice", None)
     if notice:
         st.success(notice)
 
-    jobs = job_summary_df()
+    jobs = job_summary_df("in_progress")
     if jobs.empty:
         st.info("No active work orders.")
         return
@@ -1390,37 +1440,70 @@ def render_active_jobs() -> None:
     if detail:
         st.subheader(f"{detail['job_number']} — {detail['customer_name']}")
         render_invoice_outputs(int(selected_job_id))
-
-        st.subheader("Payment / receipt tracking")
-        with st.form("payment_update_form"):
-            payment_status = st.selectbox(
-                "Payment status",
-                PAYMENT_STATUS_OPTIONS,
-                index=PAYMENT_STATUS_OPTIONS.index(detail["payment_status"])
-                if detail["payment_status"] in PAYMENT_STATUS_OPTIONS
-                else 0,
-            )
-            zettle_receipt_number = st.text_input("Zettle receipt number", value=detail.get("zettle_receipt_number") or "")
-            zettle_receipt_url = st.text_input("Zettle receipt URL", value=detail.get("zettle_receipt_url") or "")
-            paypal_invoice_id = st.text_input("PayPal invoice ID", value=detail.get("paypal_invoice_id") or "")
-            paypal_invoice_url = st.text_input("PayPal invoice URL", value=detail.get("paypal_invoice_url") or "")
-            if st.form_submit_button("Update payment details"):
-                update_payment_status(
-                    int(selected_job_id),
-                    payment_status,
-                    zettle_receipt_number,
-                    zettle_receipt_url,
-                    paypal_invoice_id,
-                    paypal_invoice_url,
-                )
-                st.success("Payment details updated.")
-                st.rerun()
+        render_payment_tracking(detail, int(selected_job_id), "active_payment_update_form")
 
         st.divider()
         st.subheader("Work order actions")
+        if st.button("Mark work order Closed", type="primary", use_container_width=True):
+            update_job_status(int(selected_job_id), "Closed")
+            st.session_state["job_notice"] = f"{detail['job_number']} marked Closed."
+            st.rerun()
         st.caption("Moving a work order to Trash hides it from normal views and exports. It can be restored later.")
-        if st.button("Move work order to Trash", type="primary", use_container_width=True):
+        if st.button("Move work order to Trash", use_container_width=True):
             confirm_trash_job(int(selected_job_id))
+
+
+def render_completed_jobs() -> None:
+    jobs = job_summary_df("completed")
+    if jobs.empty:
+        st.info("No completed work orders.")
+        return
+
+    st.dataframe(
+        jobs[
+            [
+                "job_number",
+                "date_created",
+                "customer",
+                "bike",
+                "template",
+                "payment_status",
+                "subtotal",
+                "tax",
+                "total",
+                "zettle_receipt_number",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if st.session_state.get("completed_job_selector") not in jobs["job_id"].tolist():
+        st.session_state.pop("completed_job_selector", None)
+
+    selected_job_id = st.selectbox(
+        "Select completed job to view/generate invoice",
+        jobs["job_id"].tolist(),
+        format_func=lambda jid: jobs.loc[jobs["job_id"] == jid, "job_number"].iloc[0],
+        key="completed_job_selector",
+    )
+    detail = get_job_detail(int(selected_job_id))
+    if not detail:
+        return
+
+    st.subheader(f"{detail['job_number']} — {detail['customer_name']}")
+    render_invoice_outputs(int(selected_job_id))
+    render_payment_tracking(detail, int(selected_job_id), "completed_payment_update_form")
+
+    st.divider()
+    st.subheader("Work order actions")
+    if st.button("Reopen work order", type="primary", use_container_width=True):
+        update_job_status(int(selected_job_id), "In progress")
+        st.session_state["job_notice"] = f"{detail['job_number']} reopened."
+        st.rerun()
+    st.caption("Moving a work order to Trash hides it from normal views and exports. It can be restored later.")
+    if st.button("Move completed work order to Trash", use_container_width=True):
+        confirm_trash_job(int(selected_job_id))
 
 
 def render_trashed_jobs() -> None:
@@ -1480,9 +1563,11 @@ def render_trashed_jobs() -> None:
 
 def page_jobs_invoices() -> None:
     st.header("Jobs + Invoices")
-    active_tab, trash_tab = st.tabs(["Active work orders", "Trash"])
+    active_tab, completed_tab, trash_tab = st.tabs(["In progress", "Completed", "Trash"])
     with active_tab:
         render_active_jobs()
+    with completed_tab:
+        render_completed_jobs()
     with trash_tab:
         render_trashed_jobs()
 
@@ -1681,7 +1766,7 @@ def main() -> None:
     init_db()
 
     st.title("Precison Bicycle Services: Order and Invoicing System")
-    st.caption("Templates, customer/bike history, invoice text, and Zettle/PayPal entry summaries.")
+    st.caption("Job templates, customer/bike history, invoice preparation and email, and PayPal entry summaries.")
 
     page = st.sidebar.radio(
         "Go to",
@@ -1689,7 +1774,7 @@ def main() -> None:
             "New Job Order",
             "Jobs + Invoices",
             "Customers + Bikes",
-            "Templates",
+            "Job Templates",
             "Dashboard + Exports",
         ],
     )
@@ -1700,7 +1785,7 @@ def main() -> None:
         page_jobs_invoices()
     elif page == "Customers + Bikes":
         page_customers_bikes()
-    elif page == "Templates":
+    elif page == "Job Templates":
         page_templates()
     elif page == "Dashboard + Exports":
         page_dashboard_exports()
